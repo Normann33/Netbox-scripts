@@ -4,6 +4,7 @@ import requests
 import pynetbox
 import csv
 import io
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,6 +23,11 @@ NETBOX_TOKEN = netbox_token
 NETDISCO_URL = netdisco_url
 NETDISCO_USER = netdisco_username       
 NETDISCO_PASS = netdisco_password       
+
+# --- НАСТРОЙКИ ПАПКИ С КОНФИГАМИ ---
+RAW_CONFIGS_DIR = "~/backbone/configs"
+CONFIGS_DIR = os.path.expanduser(RAW_CONFIGS_DIR)  # Путь к папке, где лежат конфиги устройств
+# CONFIG_EXTENSION = ""  # Расширение файлов конфигов (.cfg, .txt, .conf)
 
 
 def get_netdisco_session():
@@ -46,40 +52,43 @@ def get_netdisco_session():
         return None
 
 
-def get_real_interface_name(management_ip, req_headers):
+def get_interface_from_config(device_name, management_ip):
     """
-    Запрашивает таблицу IP-адресов устройства из Netdisco по URL /object/device/{ip}/device_ips
-    и находит точное имя интерфейса, на котором висит конкретный Management IP
+    Открывает файл конфигурации устройства и ищет, 
+    на каком интерфейсе прописан указанный management_ip
     """
-    device_ips_url = f"{NETDISCO_URL}/api/v1/object/device/{management_ip}/device_ips"
+    file_path = os.path.join(CONFIGS_DIR, f"{device_name}")
     
+    if not os.path.exists(file_path):
+        print(f"   ⚠️  Файл конфигурации не найден по пути: {file_path}")
+        return None
+
     try:
-        res = requests.get(device_ips_url, headers=req_headers)
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            config_text = f.read()
+
+        # Регулярное выражение для Cisco-подобных конфигов (работает для Cisco, Huawei, Eltex, Arista)
+        # Оно ищет блок "interface <имя>", внутри которого (до следующего интерфейса или восклицательного знака)
+        # содержится наш целевой IP-адрес.
+        pattern = r"interface\s+([^\n!]+)(?:\n(?:[ \t]+[^\n]+)*\n[ \t]+ip\s+address\s+" + re.escape(management_ip) + r"\b)"
         
-        if res.status_code == 200:
-            ips_data = res.json()
-            
-            # Строго перебираем все IP-адреса устройства
-            for item in ips_data:
-                current_ip = item.get("ip", "").strip()
-                
-                # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Вытаскиваем интерфейс только для нашего конкретного менеджмент-IP!
-                if current_ip == management_ip:
-                    interface_name = item.get("port")
-                    if interface_name:
-                        return interface_name.strip()
-            
-            print(f"   ⚠️  Специфичный IP {management_ip} не найден в таблице /device_ips устройства.")
-        else:
-            print(f"   ⚠️  Не удалось получить /device_ips. Статус: {res.status_code}")
-            
+        match = re.search(pattern, config_text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+
+        # Запасной вариант (построчный поиск "назад"): если регулярка не сработала из-за форматирования
+        lines = config_text.splitlines()
+        for idx, line in enumerate(lines):
+            if management_ip in line and "ip address" in line.lower():
+                # Двигаемся вверх от строки с IP-адресом в поисках объявления интерфейса
+                for i in range(idx - 1, -1, -1):
+                    if lines[i].strip().lower().startswith("interface"):
+                        return lines[i].replace("interface", "").strip()
+
     except Exception as e:
-        print(f"   ⚠️  Ошибка при запросе /object/device/.../device_ips для {management_ip}: {e}")
-    
-    return None  # Подстраховка: main() подставит 'mgmt0', если совпадение не найдено
-
-
-
+        print(f"   ❌ Ошибка при чтении файла конфигурации {file_path}: {e}")
+        
+    return None
 
 
 def get_or_create_interface(nb, nb_dev, interface_name):
@@ -92,19 +101,16 @@ def get_or_create_interface(nb, nb_dev, interface_name):
     try:
         name_lower = interface_name.lower()
         
-        # 1. Проверяем на виртуальные/логические интерфейсы
+        # Автоопределение типа для NetBox 4.x
         if any(kw in name_lower for kw in ["vlan", "loopback", "bvi", "lo", "port-channel", "po"]):
             iface_type = "virtual"
-            
-        # 2. Динамически определяем скорость для физических интерфейсов
         elif "ten" in name_lower or "tg" in name_lower:
-            iface_type = "10base-x-sfpp"       # 10 Гбит/с SFP+
+            iface_type = "10base-x-sfpp"       
         elif "gig" in name_lower or "ge" in name_lower:
-            iface_type = "1000base-t"          # 1 Гбит/с Copper
+            iface_type = "1000base-t"          
         elif "fast" in name_lower or "fa" in name_lower:
-            iface_type = "100base-tx"          # 100 Мбит/с FastEthernet
+            iface_type = "100base-tx"          
         else:
-            # Универсальный дефолт для Linux-подобных имен (eth0, enp3s0) или OOB-портов управления
             iface_type = "1000base-t"
         
         new_iface = nb.dcim.interfaces.create(
@@ -119,7 +125,6 @@ def get_or_create_interface(nb, nb_dev, interface_name):
         return None
 
 
-
 def main():
     # 1. Авторизуемся в Netdisco
     api_token = get_netdisco_session()
@@ -132,11 +137,9 @@ def main():
 
     # 2. Инициализируем NetBox
     nb = pynetbox.api(NETBOX_URL, token=NETBOX_TOKEN)
-    
-    # Запрашиваем только активные устройства
     nb_devices = nb.dcim.devices.filter(status="active")
     
-    print("\n🔄 Начинаем сверку устройств по имени...")
+    print("\n🔄 Начинаем точную сверку устройств...")
     
     for nb_dev in nb_devices:
         if not nb_dev.name:
@@ -144,9 +147,9 @@ def main():
             
         device_name = nb_dev.name.strip()
 
-        # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Если Primary IP уже есть — полностью пропускаем устройство
+        # Если Primary IP уже есть — полностью пропускаем устройство
         if nb_dev.primary_ip4:
-            print(f"🔹 {device_name}: уже имеет Primary IP ({nb_dev.primary_ip4.address}). Пропускаем.")
+            print(f"🔹 {device_name}: уже имеет Primary IP. Пропускаем.")
             continue
         
         # 3. Запрос к Netdisco для поиска устройства
@@ -168,36 +171,31 @@ def main():
             print(f"❓ Устройство '{device_name}' не найдено в базе Netdisco.")
             continue
             
-        # === СТРОГАЯ ВАЛИДАЦИЯ ИМЕН ===
+        # СТРОГАЯ ВАЛИДАЦИЯ ИМЕН (Разделяем switch-3 и switch-3-3)
         disco_device = None
         for dev in search_data:
             sys_name = dev.get("System Name", "").strip()
-            
-            # Вариант 1: Полное совпадение (switch-3 == switch-3)
-            # Вариант 2: Совпадение короткого имени с FQDN (switch-3 == switch-3.domain.local)
             if sys_name.lower() == device_name.lower() or sys_name.lower().startswith(device_name.lower() + "."):
                 disco_device = dev
                 break
         
-        # Если после перебора точное совпадение не найдено (например, искали switch-3, а вернулся только switch-3-3)
         if not disco_device:
-            print(f"❓ Точное совпадение для устройства '{device_name}' не найдено в выдаче Netdisco. Пропускаем.")
+            print(f"❓ Точное совпадение для устройства '{device_name}' не найдено в выдаче Netdisco.")
             continue
-        # === КОНЕЦ ВАЛИДАЦИИ ===
-        
+            
         real_serial = disco_device.get("Serials", "").strip()
         real_os_version = disco_device.get("OS Version", "").strip()
         management_ip = disco_device.get("Management IP", "").strip()
         
         has_changes = False
         
-        # Сверка серийника
+        # Обновляем серийник
         if real_serial and nb_dev.serial != real_serial:
             print(f"🔎 Найдено расхождение серийного номера для {nb_dev.name}: '{nb_dev.serial}' -> '{real_serial}'")
             nb_dev.serial = real_serial
             has_changes = True
             
-        # Сверка версии ОС
+        # Обновляем ОС
         if hasattr(nb_dev, 'custom_fields') and 'os_version' in nb_dev.custom_fields:
             if nb_dev.custom_fields['os_version'] != real_os_version:
                 print(f"🔎 Найдено расхождение версии ОС для {nb_dev.name}: '{real_os_version}'")
@@ -211,29 +209,28 @@ def main():
             except Exception as e:
                 print(f"   ❌ Ошибка сохранения базовых данных {nb_dev.name}: {e}")
 
-        # 4. НАПОЛНЕНИЕ IP И ИНТЕРФЕЙСОВ (Только для пустых устройств)
+        # 4. НАПОЛНЕНИЕ IP И ИНТЕРФЕЙСОВ ИЗ КОНФИГА
         if management_ip:
             print(f"🚀 Заполнение сетевых данных для {nb_dev.name} -> IP: {management_ip}")
             
-            # Узнаем реальное имя интерфейса из Netdisco
-            target_iface_name = get_real_interface_name(management_ip, req_headers)
-            print(f"   ℹ️ Netdisco сообщил реальный интерфейс: '{target_iface_name}'")
+            # ИЩЕМ ИНТЕРФЕЙС В ЛОКАЛЬНОМ КОНФИГЕ ФАЙЛА
+            target_iface_name = get_interface_from_config(device_name, management_ip)
+            
+            if not target_iface_name:
+                print(f"   ⚠️  Не удалось определить интерфейс из конфига. Подстраховка: 'mgmt0'")
+                target_iface_name = "mgmt0"
+            else:
+                print(f"   ℹ️  Интерфейс успешно определен из файла конфигурации: '{target_iface_name}'")
 
-            # Проверяем, существует ли уже такой IP в NetBox IPAM
             ip_object = nb.ipam.ip_addresses.get(address=management_ip)
-
-            if ip_object:
-                # IP найден. Так как устройство гарантированно не имело primary_ip, 
-                # просто привязываем существующий IP к нашему новому/найденному интерфейсу
-                target_interface = get_or_create_interface(nb, nb_dev, target_iface_name)
-                if target_interface:
+            target_interface = get_or_create_interface(nb, nb_dev, target_iface_name)
+            
+            if target_interface:
+                if ip_object:
                     ip_object.assigned_object_type = "dcim.interface"
                     ip_object.assigned_object_id = target_interface.id
                     ip_object.save()
-            else:
-                # IP не существует в NetBox, создаем его с нуля на нужном интерфейсе
-                target_interface = get_or_create_interface(nb, nb_dev, target_iface_name)
-                if target_interface:
+                else:
                     try:
                         ip_object = nb.ipam.ip_addresses.create(
                             address=f"{management_ip}/32",
@@ -244,18 +241,13 @@ def main():
                         print(f"   ❌ Не удалось создать IP-адрес {management_ip}: {e}")
                         ip_object = None
 
-            # Назначаем созданный/найденный IP как Primary IPv4
             if ip_object:
                 try:
                     nb_dev.primary_ip4 = ip_object.id
                     nb_dev.save()
-                    print(f"   ✅ IP {management_ip} успешно назначен как Primary IPv4 на интерфейс '{target_iface_name}'.")
+                    print(f"   ✅ IP {management_ip} успешно назначен как Primary IPv4.")
                 except Exception as e:
                     print(f"   ❌ Ошибка при назначении Primary IP для {nb_dev.name}: {e}")
-        else:
-            print(f"⚠️ Устройство {device_name} найдено в Netdisco, но у него пустой Management IP.")
-
-    print("\n🎉 Синхронизация базовых данных и IP-адресов успешно завершена!")
 
 if __name__ == "__main__":
     main()
