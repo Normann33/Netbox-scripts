@@ -8,49 +8,49 @@ load_dotenv()
 netbox_url = os.getenv("NETBOX_URL")
 netbox_token = keyring.get_password("Netbox", "netbox")
 
-# Инициализируем NetBox
 nb = pynetbox.api(netbox_url, token=netbox_token)
 
-def cleanup_netbox():
-    print("🚀 Запуск скрипта очистки Primary IP и пустых интерфейсов в NetBox...")
+def total_cleanup():
+    print("🧹 Запуск тотальной очистки NetBox перед пересозданием...")
     
-    # 1. Получаем все активные устройства
     devices = list(nb.dcim.devices.filter(status="active"))
-    print(f"📋 Найдено активных устройств для проверки: {len(devices)}")
+    print(f"📋 Найдено активных устройств: {len(devices)}")
     
     for dev in devices:
-        has_changes = False
-        
-        # 2. Сбрасываем статус Primary IPv4
+        # 1. Сбрасываем Primary IP
+        if not dev.primary_ip4:
+            print(f"  🔄 Нет Primary IP для {dev.name}, продолжаем")
+            continue
         if dev.primary_ip4:
-            print(f"🔄 Сбрасываем Primary IP для устройства: {dev.name}")
-            dev.primary_ip4 = None
+            print(f"  🔄 Сброс Primary IP для {dev.name}")
+            
+            # Сразу удаляем сам объект IP-адреса из базы IPAM, чтобы он не мешался
             try:
+                ip_id = dev.primary_ip4.id
+                dev.primary_ip4 = None
                 dev.save()
-                has_changes = True
-            except Exception as e:
-                print(f"   ❌ Не удалось сбросить Primary IP для {dev.name}: {e}")
-                continue
-        
-        # Перезапрашиваем актуальное состояние интерфейсов устройства
-        interfaces = list(nb.dcim.interfaces.filter(device_id=dev.id))
-        
-        for iface in interfaces:
-            # 3. Нас интересуют только автоматически созданные нами интерфейсы
-            if iface.name in ["Loopback0", "mgmt0"]:
-                # Проверяем, есть ли на этом интерфейсе какие-либо IP-адреса
-                ip_count = len(list(nb.ipam.ip_addresses.filter(interface_id=iface.id)))
                 
-                # Если интерфейс остался пустой — удаляем его
-                if ip_count == 0:
-                    print(f"   🧹 Интерфейс '{iface.name}' на {dev.name} пуст. Удаляем...")
-                    try:
-                        iface.delete()
-                        print(f"   🗑️  Успешно удален.")
-                    except Exception as e:
-                        print(f"   ⚠️  Не удалось удалить интерфейс {iface.name}: {e}")
+                # Удаляем IP из NetBox полностью
+                nb.ipam.ip_addresses.delete([ip_id])
+            except Exception as e:
+                print(f"    ❌ Ошибка при удалении IP для {dev.name}: {e}")
+        
+        # 2. Удаляем старые интерфейсы, которые мы генерировали
+        interfaces = list(nb.dcim.interfaces.filter(device_id=dev.id))
+        for iface in interfaces:
+            if iface.name in ["Loopback0", "mgmt0"]:
+                # Если на интерфейсе всё еще висят какие-то "забытые" IP — удаляем их
+                assigned_ips = nb.ipam.ip_addresses.filter(interface_id=iface.id)
+                for ip in assigned_ips:
+                    ip.delete()
+                    
+                print(f"  🗑️ Удаление интерфейса '{iface.name}' на {dev.name}")
+                try:
+                    iface.delete()
+                except Exception as e:
+                    print(f"    ❌ Не удалось удалить интерфейс: {e}")
 
-    print("\n🎉 Очистка завершена! Теперь база готова к повторному корректному наполнению.")
+    print("\n🎉 База полностью зачищена от старых менеджмент IP и интерфейсов!")
 
 if __name__ == "__main__":
-    cleanup_netbox()
+    total_cleanup()

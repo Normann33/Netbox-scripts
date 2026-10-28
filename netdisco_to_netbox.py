@@ -47,42 +47,77 @@ def get_netdisco_session():
 
 
 def get_real_interface_name(management_ip, req_headers):
-    """Запрашивает у Netdisco реальное имя интерфейса, на котором висит Management IP"""
-    ip_search_url = f"{NETDISCO_URL}/api/v1/search/ip"
-    try:
-        res = requests.get(ip_search_url, headers=req_headers, params={"q": management_ip})
-        if res.status_code == 200:
-            csv_text = res.content.decode('utf-8')
-            reader = csv.DictReader(io.StringIO(csv_text.strip()))
-            for row in reader:
-                if row.get("ip") == management_ip and row.get("port"):
-                    return row.get("port").strip()
-    except Exception as e:
-        print(f"   ⚠️ Ошибка при запросе имени интерфейса для {management_ip}: {e}")
+    """
+    Запрашивает таблицу IP-адресов устройства из Netdisco по URL /object/device/{ip}/device_ips
+    и находит точное имя интерфейса, на котором висит конкретный Management IP
+    """
+    device_ips_url = f"{NETDISCO_URL}/api/v1/object/device/{management_ip}/device_ips"
     
-    return "mgmt0"  # Дефолтная подстраховка
+    try:
+        res = requests.get(device_ips_url, headers=req_headers)
+        
+        if res.status_code == 200:
+            ips_data = res.json()
+            
+            # Строго перебираем все IP-адреса устройства
+            for item in ips_data:
+                current_ip = item.get("ip", "").strip()
+                
+                # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Вытаскиваем интерфейс только для нашего конкретного менеджмент-IP!
+                if current_ip == management_ip:
+                    interface_name = item.get("port")
+                    if interface_name:
+                        return interface_name.strip()
+            
+            print(f"   ⚠️  Специфичный IP {management_ip} не найден в таблице /device_ips устройства.")
+        else:
+            print(f"   ⚠️  Не удалось получить /device_ips. Статус: {res.status_code}")
+            
+    except Exception as e:
+        print(f"   ⚠️  Ошибка при запросе /object/device/.../device_ips для {management_ip}: {e}")
+    
+    return None  # Подстраховка: main() подставит 'mgmt0', если совпадение не найдено
+
+
+
 
 
 def get_or_create_interface(nb, nb_dev, interface_name):
-    """Ищет интерфейс по имени в NetBox, если не находит — создает его"""
+    """Ищет интерфейс по имени в NetBox, если не находит — создает его с правильным типом"""
     existing_iface = nb.dcim.interfaces.get(device_id=nb_dev.id, name=interface_name)
     if existing_iface:
         return existing_iface
         
     print(f"   ⚠️  Интерфейс '{interface_name}' не найден в NetBox. Создаем...")
     try:
-        # Угадываем тип интерфейса на основе его имени для NetBox 4.x
-        iface_type = "virtual" if "vlan" in interface_name.lower() or "loopback" in interface_name.lower() else "100base-tx"
+        name_lower = interface_name.lower()
+        
+        # 1. Проверяем на виртуальные/логические интерфейсы
+        if any(kw in name_lower for kw in ["vlan", "loopback", "bvi", "lo", "port-channel", "po"]):
+            iface_type = "virtual"
+            
+        # 2. Динамически определяем скорость для физических интерфейсов
+        elif "ten" in name_lower or "tg" in name_lower:
+            iface_type = "10base-x-sfpp"       # 10 Гбит/с SFP+
+        elif "gig" in name_lower or "ge" in name_lower:
+            iface_type = "1000base-t"          # 1 Гбит/с Copper
+        elif "fast" in name_lower or "fa" in name_lower:
+            iface_type = "100base-tx"          # 100 Мбит/с FastEthernet
+        else:
+            # Универсальный дефолт для Linux-подобных имен (eth0, enp3s0) или OOB-портов управления
+            iface_type = "1000base-t"
         
         new_iface = nb.dcim.interfaces.create(
             device=nb_dev.id,
             name=interface_name,
             type=iface_type
         )
+        print(f"   ✅ Создан интерфейс '{interface_name}' с типом '{iface_type}'")
         return new_iface
     except Exception as e:
         print(f"   ❌ Не удалось создать интерфейс '{interface_name}': {e}")
         return None
+
 
 
 def main():
@@ -133,8 +168,23 @@ def main():
             print(f"❓ Устройство '{device_name}' не найдено в базе Netdisco.")
             continue
             
-        # Берем первое устройство из результатов поиска
-        disco_device = search_data[0]
+        # === СТРОГАЯ ВАЛИДАЦИЯ ИМЕН ===
+        disco_device = None
+        for dev in search_data:
+            sys_name = dev.get("System Name", "").strip()
+            
+            # Вариант 1: Полное совпадение (switch-3 == switch-3)
+            # Вариант 2: Совпадение короткого имени с FQDN (switch-3 == switch-3.domain.local)
+            if sys_name.lower() == device_name.lower() or sys_name.lower().startswith(device_name.lower() + "."):
+                disco_device = dev
+                break
+        
+        # Если после перебора точное совпадение не найдено (например, искали switch-3, а вернулся только switch-3-3)
+        if not disco_device:
+            print(f"❓ Точное совпадение для устройства '{device_name}' не найдено в выдаче Netdisco. Пропускаем.")
+            continue
+        # === КОНЕЦ ВАЛИДАЦИИ ===
+        
         real_serial = disco_device.get("Serials", "").strip()
         real_os_version = disco_device.get("OS Version", "").strip()
         management_ip = disco_device.get("Management IP", "").strip()
