@@ -10,7 +10,7 @@ load_dotenv()
 
 netdisco_url = os.getenv("NETDISCO_URL")
 netdisco_username = os.getenv("NETDISCO_USER")
-netdisco_password = keyring.get_password("Netdisco", "admin")
+netdisco_password = keyring.get_password("Netdisco", netdisco_username)
 netbox_url = os.getenv("NETBOX_URL")
 netbox_token = keyring.get_password("Netbox", "netbox")
 
