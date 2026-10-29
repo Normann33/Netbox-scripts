@@ -68,7 +68,7 @@ def get_or_create_interface(nb, nb_dev, interface_name):
 
 def sync_lldp_links(nb, nb_dev, management_ip, req_headers, processed_pairs):
     """Запрашивает связи устройства из Netdisco и строит их в NetBox"""
-    links_url = f"{NETDISCO_URL}/api/v1/object/device/{management_ip}/links"
+    links_url = f"{NETDISCO_URL}/api/v1/object/device/{management_ip}/neighbors"
     
     try:
         res = requests.get(links_url, headers=req_headers)
