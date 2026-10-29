@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Авторизация в системах
 netdisco_url = os.getenv("NETDISCO_URL")
 netdisco_username = os.getenv("NETDISCO_USER")
 netdisco_password = keyring.get_password("Netdisco", netdisco_username)
@@ -24,12 +23,10 @@ NETDISCO_URL = netdisco_url
 NETDISCO_USER = netdisco_username       
 NETDISCO_PASS = netdisco_password       
 
-# --- НАСТРОЙКИ ПАПКИ С КОНФИГАМИ ---
 RAW_CONFIGS_DIR = "~/backbone/configs"  
 CONFIGS_DIR = os.path.expanduser(RAW_CONFIGS_DIR)  
-CONFIG_EXTENSION = ".cfg"  
+CONFIG_EXTENSION = ""  
 
-# URL официальной библиотеки шаблонов NetBox на GitHub (raw-файлы)
 GITHUB_LIBRARY_URL = "https://githubusercontent.com"
 
 
@@ -44,79 +41,50 @@ def get_netdisco_session():
     except requests.exceptions.RequestException:
         return None
 
-
 def resolve_dns(device_name):
-    try:
-        return socket.gethostbyname(device_name)
-    except socket.gaierror:
-        return None
-
+    try: return socket.gethostbyname(device_name)
+    except socket.gaierror: return None
 
 def get_or_create_manufacturer(nb, vendor_name):
     slug = vendor_name.lower().replace(" ", "-").replace(".", "")
     manufacturer = nb.dcim.manufacturers.get(slug=slug)
-    if manufacturer:
-        return manufacturer
-        
-    print(f"   🏭 Производитель '{vendor_name}' не найден в NetBox. Создаем...")
-    try:
-        return nb.dcim.manufacturers.create(name=vendor_name, slug=slug)
-    except Exception as e:
-        print(f"   ❌ Не удалось создать производителя '{vendor_name}': {e}")
-        return None
-
+    if manufacturer: return manufacturer
+    try: return nb.dcim.manufacturers.create(name=vendor_name, slug=slug)
+    except Exception: return None
 
 def download_yaml_from_github(vendor, model):
     github_vendor = vendor.lower().replace(" ", "-")
     github_model = model.lower().replace(" ", "-")
-    
     yaml_url = f"{GITHUB_LIBRARY_URL}/{github_vendor}/{github_model}.yaml"
     res = requests.get(yaml_url)
-    if res.status_code == 200:
-        return res.text
-        
+    if res.status_code == 200: return res.text
     yaml_url_alt = f"{GITHUB_LIBRARY_URL}/{github_vendor}/{github_model}.yml"
     res_alt = requests.get(yaml_url_alt)
-    if res_alt.status_code == 200:
-        return res_alt.text
-        
+    if res_alt.status_code == 200: return res_alt.text
     return None
 
 
 def main():
-    # 1. Авторизация
     api_token = get_netdisco_session()
-    if not api_token:
-        print("🛑 Ошибка авторизации в Netdisco.")
-        return
+    if not api_token: return
 
     req_headers = {"Authorization": api_token}
     nb = pynetbox.api(NETBOX_URL, token=NETBOX_TOKEN)
-    
     nb_devices = nb.dcim.devices.filter(status="active")
     unique_models_to_fetch = {}
     
     print("\n🔍 Анализируем сеть и ищем используемые модели устройств...")
     
     for nb_dev in nb_devices:
-        if not nb_dev.name:
-            continue
-            
+        if not nb_dev.name: continue
         device_name = nb_dev.name.strip()
         
-        # Проверяем, есть ли локальный конфиг
-        file_path = os.path.join(CONFIGS_DIR, f"{device_name}")
-        if not os.path.exists(file_path):
-            print(f"Skip: {device_name} (конфиг не найден)")
-            continue
+        file_path = os.path.join(CONFIGS_DIR, f"{device_name}{CONFIG_EXTENSION}")
+        if not os.path.exists(file_path): continue
             
-        # Резолвим IP
         management_ip = nb_dev.primary_ip4.address.split('/') if nb_dev.primary_ip4 else resolve_dns(device_name)
-        if not management_ip:
-            print(f"❌ {device_name}: Не удалось разрешить имя через DNS. Пропускаем.")
-            continue
+        if not management_ip: continue
             
-        # Запрашиваем информацию из Netdisco
         try:
             res = requests.get(f"{NETDISCO_URL}/api/v1/object/device/{management_ip}", headers=req_headers)
             if res.status_code == 200:
@@ -129,14 +97,19 @@ def main():
                     model = disco_device.get("Model", "").strip()
                     
                     if vendor and model:
-                        # Проверяем, существует ли уже такой тип устройства в самом NetBox
                         exists_in_netbox = nb.dcim.device_types.get(model=model)
-                        
-                        if exists_in_netbox:
-                            # ДОБАВЛЕНО: Информируем, если шаблон уже есть в NetBox
-                            print(f"🔹 Модель '{model}' уже существует в NetBox. Пропускаем.")
-                        else:
+                        # Если шаблона вообще нет, или у него нет шаблонов портов (индекс 0)
+                        if not exists_in_netbox:
                             unique_models_to_fetch[model] = vendor
+                        else:
+                            templates = list(nb.dcim.interface_templates.filter(device_type_id=exists_in_netbox.id))
+                            if len(templates) == 0:
+                                # Шаблон пустой, удалим его и перекачаем нормально
+                                print(f"♻️  Обнаружен пустой шаблон для '{model}'. Пометили на перезаливку.")
+                                exists_in_netbox.delete()
+                                unique_models_to_fetch[model] = vendor
+                            else:
+                                print(f"🔹 Модель '{model}' уже корректно существует в NetBox. Пропускаем.")
         except Exception:
             continue
 
@@ -144,15 +117,12 @@ def main():
         print("\n🔹 Новых моделей для импорта не найдено.")
         return
 
-    print(f"\n📋 Найдено новых уникальных моделей для импорта с GitHub: {len(unique_models_to_fetch)}")
-
-    # 2. Скачивание и импорт шаблонов
+    # 2. Скачивание и тотальный импорт с компонентами
     for model_name, vendor_name in unique_models_to_fetch.items():
-        print(f"\n🚀 Обработка модели '{model_name}' ({vendor_name})...")
+        print(f"\n🚀 Импорт модели '{model_name}' ({vendor_name}) вместе с портами...")
         
         manufacturer = get_or_create_manufacturer(nb, vendor_name)
-        if not manufacturer:
-            continue
+        if not manufacturer: continue
 
         yaml_content = download_yaml_from_github(vendor_name, model_name)
         if not yaml_content:
@@ -162,6 +132,7 @@ def main():
         try:
             parsed_yaml = yaml.safe_load(yaml_content)
             
+            # Создаем базовый Device Type
             device_type_data = {
                 "manufacturer": manufacturer.id,
                 "model": parsed_yaml.get("model", model_name),
@@ -170,15 +141,29 @@ def main():
                 "u_height": parsed_yaml.get("u_height", 1),
                 "is_full_depth": parsed_yaml.get("is_full_depth", True)
             }
+            new_device_type = nb.dcim.device_types.create(**device_type_data)
             
-            nb.dcim.device_types.create(**device_type_data)
-            # ДОБАВЛЕНО: Сообщение об успешной заливке шаблона
-            print(f"   ✅ Шаблон устройства '{model_name}' успешно скачан и зарегистрирован в NetBox!")
+            # ИМПОРТ КОМПОНЕНТОВ: Нарезаем интерфейсы из YAML-файла
+            interfaces_imported = 0
+            if "interfaces" in parsed_yaml and parsed_yaml["interfaces"]:
+                for iface in parsed_yaml["interfaces"]:
+                    try:
+                        nb.dcim.interface_templates.create(
+                            device_type=new_device_type.id,
+                            name=iface.get("name"),
+                            type=iface.get("type", "1000base-t"),
+                            mgmt_only=iface.get("mgmt_only", False)
+                        )
+                        interfaces_imported += 1
+                    except Exception:
+                        pass
+
+            print(f"   ✅ Шаблон устройства '{model_name}' успешно зарегистрирован! Создано {interfaces_imported} шаблонов интерфейсов.")
             
         except Exception as e:
-            print(f"   ❌ Ошибка при импорте шаблона для {model_name} в NetBox: {e}")
+            print(f"   ❌ Ошибка при импорте шаблона для {model_name}: {e}")
 
-    print("\n🎉 Процесс автоматического импорта шаблонов завершен!")
+    print("\n🎉 Импорт фабричных шаблонов с портами успешно завершен!")
 
 if __name__ == "__main__":
     main()
