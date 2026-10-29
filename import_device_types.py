@@ -24,10 +24,10 @@ NETDISCO_URL = netdisco_url
 NETDISCO_USER = netdisco_username       
 NETDISCO_PASS = netdisco_password       
 
-# --- НАСТРОЙКИ ПАПКИ С КОНФИГАМИ (Для фильтрации) ---
+# --- НАСТРОЙКИ ПАПКИ С КОНФИГАМИ ---
 RAW_CONFIGS_DIR = "~/backbone/configs"  
 CONFIGS_DIR = os.path.expanduser(RAW_CONFIGS_DIR)  
-CONFIG_EXTENSION = ""  
+CONFIG_EXTENSION = ".cfg"  
 
 # URL официальной библиотеки шаблонов NetBox на GitHub (raw-файлы)
 GITHUB_LIBRARY_URL = "https://githubusercontent.com"
@@ -104,14 +104,13 @@ def main():
             
         device_name = nb_dev.name.strip()
         
-        # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Проверяем, есть ли локальный конфиг для этого устройства.
-        # Если файла нет — сразу скипаем и не тратим запросы к DNS, Netdisco и GitHub.
+        # Проверяем, есть ли локальный конфиг
         file_path = os.path.join(CONFIGS_DIR, f"{device_name}")
         if not os.path.exists(file_path):
-            print(f"⏭️  {device_name}: конфиг не найден ({file_path}). Пропускаем.")
+            print(f"Skip: {device_name} (конфиг не найден)")
             continue
             
-        # Резолвим IP для точного запроса
+        # Резолвим IP
         management_ip = nb_dev.primary_ip4.address.split('/') if nb_dev.primary_ip4 else resolve_dns(device_name)
         if not management_ip:
             print(f"❌ {device_name}: Не удалось разрешить имя через DNS. Пропускаем.")
@@ -130,17 +129,22 @@ def main():
                     model = disco_device.get("Model", "").strip()
                     
                     if vendor and model:
+                        # Проверяем, существует ли уже такой тип устройства в самом NetBox
                         exists_in_netbox = nb.dcim.device_types.get(model=model)
-                        if not exists_in_netbox:
+                        
+                        if exists_in_netbox:
+                            # ДОБАВЛЕНО: Информируем, если шаблон уже есть в NetBox
+                            print(f"🔹 Модель '{model}' уже существует в NetBox. Пропускаем.")
+                        else:
                             unique_models_to_fetch[model] = vendor
         except Exception:
             continue
 
     if not unique_models_to_fetch:
-        print("🔹 Новых моделей для импорта не найдено (или для них нет локальных файлов конфигурации).")
+        print("\n🔹 Новых моделей для импорта не найдено.")
         return
 
-    print(f"📋 Найдено новых уникальных моделей для импорта: {len(unique_models_to_fetch)}")
+    print(f"\n📋 Найдено новых уникальных моделей для импорта с GitHub: {len(unique_models_to_fetch)}")
 
     # 2. Скачивание и импорт шаблонов
     for model_name, vendor_name in unique_models_to_fetch.items():
@@ -168,7 +172,8 @@ def main():
             }
             
             nb.dcim.device_types.create(**device_type_data)
-            print(f"   ✅ Тип устройства '{model_name}' успешно зарегистрирован в NetBox.")
+            # ДОБАВЛЕНО: Сообщение об успешной заливке шаблона
+            print(f"   ✅ Шаблон устройства '{model_name}' успешно скачан и зарегистрирован в NetBox!")
             
         except Exception as e:
             print(f"   ❌ Ошибка при импорте шаблона для {model_name} в NetBox: {e}")
