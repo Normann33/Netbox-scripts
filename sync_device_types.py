@@ -25,6 +25,11 @@ NETDISCO_URL = netdisco_url
 NETDISCO_USER = netdisco_username       
 NETDISCO_PASS = netdisco_password       
 
+# --- НАСТРОЙКИ ПАПКИ С КОНФИГАМИ ---
+RAW_CONFIGS_DIR = "~/backbone/configs"  
+CONFIGS_DIR = os.path.expanduser(RAW_CONFIGS_DIR)  
+CONFIG_EXTENSION = ""  # ПОПРАВКА: Конфиги хранятся БЕЗ расширения
+
 
 def get_netdisco_session():
     """Авторизуется в Netdisco по логину/паролю из .env и keyring"""
@@ -60,7 +65,7 @@ def main():
     # 1. Авторизация в Netdisco
     api_token = get_netdisco_session()
     if not api_token:
-        print("🛑 Синхронизация типов устройств отменена из-за ошибки авторизации.")
+        print("🛑 Синхронизация отменена из-за ошибки авторизации.")
         return
 
     req_headers = {"Authorization": api_token}
@@ -70,7 +75,15 @@ def main():
     nb = pynetbox.api(NETBOX_URL, token=NETBOX_TOKEN)
     nb_devices = nb.dcim.devices.filter(status="active")
     
-    print("\n🔄 Начинаем сверку моделей устройств со словарем Netdisco...")
+    # Заранее находим или проверяем существование роли Switch в NetBox
+    # В NetBox 4.x поиск роли идет по slug
+    switch_role = nb.dcim.device_roles.get(slug="switch")
+    if not switch_role:
+        print("⚠️  Предупреждение: Роль с кодовым именем 'switch' не найдена в NetBox.")
+        print("    Убедитесь, что в NetBox UI -> Device Roles создана роль Switch со slug 'switch'.")
+        return
+
+    print("\n🔄 Начинаем комплексное обновление типов и ролей устройств...")
     
     for nb_dev in nb_devices:
         if not nb_dev.name:
@@ -78,68 +91,84 @@ def main():
             
         device_name = nb_dev.name.strip()
 
-        # Если у устройства в NetBox УЖЕ задан тип устройства (модель), пропускаем его
-        # Мы проверяем slug или имя дефолтного/пустого типа, если он "unknown" или не заполнен
-        if nb_dev.device_type and nb_dev.device_type.slug != "unknown-device": 
-            # Замените "unknown-device" на slug дефолтного типа, если вы их так создавали
-            print(f"🔹 {device_name}: уже имеет тип '{nb_dev.device_type.model}'. Пропускаем.")
+        # Проверяем наличие локального конфига БЕЗ расширения
+        file_path = os.path.join(CONFIGS_DIR, f"{device_name}{CONFIG_EXTENSION}")
+        if not os.path.exists(file_path):
+            print(f"⏭️  {device_name}: конфиг не найден. Пропускаем.")
             continue
 
-        # Определяем IP для запроса к Netdisco
-        management_ip = None
-        if nb_dev.primary_ip4:
-            management_ip = nb_dev.primary_ip4.address.split('/')[0]
-        else:
-            management_ip = resolve_dns(device_name)
+        # Переменная для отслеживания изменений по устройству
+        device_updated = False
 
-        if not management_ip:
-            print(f"❌ {device_name}: Нет IP и не резолвится в DNS. Пропустить определение модели.")
-            continue
+        # ПРОВЕРКА И ИСПРАВЛЕНИЕ РОЛИ (Server -> Switch)
+        current_role_slug = nb_dev.role.slug if nb_dev.role else ""
+        if current_role_slug == "server" or current_role_slug != "switch":
+            print(f"🔄 {device_name}: Изменяем роль '{current_role_slug}' -> 'switch'")
+            nb_dev.role = switch_role.id
+            device_updated = True
 
-        # 3. Запрашиваем карточку устройства из Netdisco по точному IP
-        device_url = f"{NETDISCO_URL}/api/v1/object/device/{management_ip}"
-        try:
-            res = requests.get(device_url, headers=req_headers)
-            if res.status_code != 200:
-                print(f"⚠️  Не удалось получить данные из Netdisco для {device_name} ({management_ip})")
-                continue
+        # ПРОВЕРКА ПРОИЗВОДИТЕЛЯ И МОДЕЛИ (Generic -> Заводской)
+        current_type_name = nb_dev.device_type.model if nb_dev.device_type else ""
+        current_vendor = nb_dev.device_type.manufacturer.name if (nb_dev.device_type and nb_dev.device_type.manufacturer) else ""
+        
+        # Если тип устройства пустой, либо производитель/модель содержат заглушку "generic"
+        need_type_update = (
+            not current_type_name or 
+            "generic" in current_type_name.lower() or 
+            "generic" in current_vendor.lower()
+        )
 
-            csv_text = res.content.decode('utf-8')
-            reader = csv.DictReader(io.StringIO(csv_text.strip()))
-            search_data = list(reader)
-            
-            if not search_data:
-                print(f"❓ Устройство {device_name} не найдено в базе Netdisco по IP {management_ip}.")
-                continue
+        if need_type_update:
+            # Резолвим IP для точечного запроса
+            management_ip = nb_dev.primary_ip4.address.split('/')[0] if nb_dev.primary_ip4 else resolve_dns(device_name)
 
-            disco_device = search_data[0]
-            # Извлекаем точную заводскую модель из Netdisco
-            disco_model_name = disco_device.get("Model", "").strip()
-
-            if not disco_model_name:
-                print(f"⚠️  В Netdisco для {device_name} поле Model оказалось пустым.")
-                continue
-
-            print(f"🔎 {device_name}: В сети обнаружена модель -> '{disco_model_name}'")
-
-            # 4. Ищем соответствующий Device Type в NetBox 4.x
-            # Поиск идет по полю model (наименование модели)
-            netbox_device_type = nb.dcim.device_types.get(model=disco_model_name)
-
-            if netbox_device_type:
-                # Нашли точное совпадение шаблона! Применяем его к устройству
-                nb_dev.device_type = netbox_device_type.id
-                try:
+            if not management_ip:
+                print(f"❌ {device_name}: Нет IP и не резолвится в DNS. Невозможно определить точную модель.")
+                # Если роль успели поменять, сохраняем её даже без обновления типа
+                if device_updated:
                     nb_dev.save()
-                    print(f"   ✅ Шаблон '{disco_model_name}' успешно применен! Физические порты созданы автоматически.")
-                except Exception as e:
-                    print(f"   ❌ Ошибка сохранения типа устройства в NetBox: {e}")
-            else:
-                print(f"   ⚠️  Шаблон для модели '{disco_model_name}' еще не загружен в NetBox. Пропустите.")
-                print(f"       👉 Скачайте его с GitHub репозитория и импортируйте в NetBox UI.")
+                continue
 
-        except Exception as e:
-            print(f"   ❌ Ошибка при обработке устройства {device_name}: {e}")
+            # 3. Запрашиваем карточку устройства из Netdisco по IP
+            device_url = f"{NETDISCO_URL}/api/v1/object/device/{management_ip}"
+            try:
+                res = requests.get(device_url, headers=req_headers)
+                if res.status_code == 200:
+                    csv_text = res.content.decode('utf-8')
+                    reader = csv.DictReader(io.StringIO(csv_text.strip()))
+                    search_data = list(reader)
+                    
+                    if search_data:
+                        disco_device = search_data
+                        disco_model_name = disco_device.get("Model", "").strip()
+                        
+                        if disco_model_name:
+                            print(f"🔎 {device_name}: В сети обнаружена заводская модель -> '{disco_model_name}'")
+                            
+                            # Ищем правильный Device Type в базе NetBox
+                            netbox_device_type = nb.dcim.device_types.get(model=disco_model_name)
+                            
+                            if netbox_device_type:
+                                # Перезаписываем старый тип Generic на корректный
+                                nb_dev.device_type = netbox_device_type.id
+                                device_updated = True
+                                print(f"   ✅ Подготовлена замена типа на '{disco_model_name}'")
+                            else:
+                                print(f"   ⚠️  Шаблон '{disco_model_name}' отсутствует в NetBox. Сначала запустите import_device_types.py")
+                else:
+                    print(f"  ⚠️  Не удалось получить данные из Netdisco для {device_name}. Статус: {res.status_code}")
+            except Exception as e:
+                print(f"   ❌ Ошибка запроса к Netdisco для {device_name}: {e}")
+
+        # Сохраняем все накопленные изменения (Роль + Тип устройства) в один проход
+        if device_updated:
+            try:
+                nb_dev.save()
+                print(f"   🎉 {device_name}: Все изменения (Роль/Тип) успешно сохранены в NetBox.")
+            except Exception as e:
+                print(f"   ❌ Ошибка сохранения устройства {device_name} в NetBox: {e}")
+        else:
+            print(f"🔹 {device_name}: Роль 'Switch' и тип '{current_type_name}' уже корректны.")
 
 if __name__ == "__main__":
     main()
