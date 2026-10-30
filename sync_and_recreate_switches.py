@@ -162,6 +162,7 @@ def get_or_create_interface(nb, nb_dev, interface_name):
         return None
 
 
+
 def get_or_create_device_type(nb, yaml_data, vendor_name):
     model_name = yaml_data.get("model")
     existing_type = nb.dcim.device_types.get(model=model_name)
