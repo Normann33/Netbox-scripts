@@ -1,18 +1,12 @@
 import os
 import keyring
-import requests
 import pynetbox
-import csv
-import io
 import re
 import socket
+import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
-
-netdisco_url = os.getenv("NETDISCO_URL")
-netdisco_username = os.getenv("NETDISCO_USER")
-netdisco_password = keyring.get_password("Netdisco", netdisco_username)
 
 netbox_url = os.getenv("NETBOX_URL")
 netbox_token = keyring.get_password("Netbox", "netbox")
@@ -21,47 +15,104 @@ netbox_token = keyring.get_password("Netbox", "netbox")
 NETBOX_URL = netbox_url
 NETBOX_TOKEN = netbox_token
 
-# --- НАСТРОЙКИ NETDISCO ---
-NETDISCO_URL = netdisco_url
-NETDISCO_USER = netdisco_username       
-NETDISCO_PASS = netdisco_password       
-
-# --- НАСТРОЙКИ ПАПКИ С КОНФИГАМИ ---
+# --- НАСТРОЙКИ ВНУТРЕННИХ ПАПОК ---
 RAW_CONFIGS_DIR = "~/backbone/configs"  
 CONFIGS_DIR = os.path.expanduser(RAW_CONFIGS_DIR)  
 CONFIG_EXTENSION = ""  # Конфиги без расширения
 
+# Путь к локальной копии папки device-types из репозитория
+RAW_LIBRARY_DIR = "~/backbone/device-types"
+LIBRARY_DIR = os.path.expanduser(RAW_LIBRARY_DIR)
 
-def get_netdisco_session():
-    login_url = f"{NETDISCO_URL}/login"
-    try:
-        response = requests.post(login_url, auth=(NETDISCO_USER, NETDISCO_PASS), headers={'Accept': 'application/json'})
-        if response.status_code == 200:
-            try: return response.json().get("api_key")
-            except ValueError: return response.text.strip()
-        return None
-    except requests.exceptions.RequestException:
-        return None
+# Читаем домен поиска из .env
+DNS_SUFFIX = os.getenv("DNS_SUFFIX", "").strip()
 
 
 def resolve_dns(device_name):
+    """Резолвит имя устройства через DNS в IP-адрес с учетом суффикса"""
+    hostname = device_name
+    if DNS_SUFFIX and not hostname.endswith(DNS_SUFFIX):
+        hostname = f"{device_name}.{DNS_SUFFIX.lstrip('.')}"
     try:
-        return socket.gethostbyname(device_name)
+        return socket.gethostbyname(hostname)
     except socket.gaierror:
+        if hostname != device_name:
+            try: return socket.gethostbyname(device_name)
+            except socket.gaierror: pass
         return None
 
 
-def get_interface_from_config(device_name, management_ip):
+def extract_part_number_from_config(device_name):
+    """Ищет партномер (PID) внутри файла конфигурации устройства"""
     file_path = os.path.join(CONFIGS_DIR, f"{device_name}{CONFIG_EXTENSION}")
     if not os.path.exists(file_path):
         return None
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        match = re.search(r"PID:\s*([A-Za-z0-9-]+)", content, re.IGNORECASE)
+        if match: return match.group(1).strip()
+        match_alt = re.search(r"Part\s*Number\s*:\s*([A-Za-z0-9-]+)", content, re.IGNORECASE)
+        if match_alt: return match_alt.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
+def find_local_template_by_pn(part_number):
+    """Сканирует локальную библиотеку и ищет совпадение по part_number в YAML"""
+    if not os.path.exists(LIBRARY_DIR):
+        return None, None
+    for root, dirs, files in os.walk(LIBRARY_DIR):
+        for file in files:
+            if file.endswith((".yaml", ".yml")):
+                file_path = os.path.join(root, file)
+                try:
+                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                        tpl_data = yaml.safe_load(f)
+                        if tpl_data:
+                            tpl_pn = tpl_data.get("part_number") or ""
+                            tpl_model = tpl_data.get("model") or ""
+                            if tpl_pn.lower() == part_number.lower() or tpl_model.lower() == part_number.lower():
+                                return tpl_data, file_path
+                except Exception: continue
+    return None, None
+
+
+def get_all_interfaces_from_config(device_name):
+    """
+    Парсит весь файл конфигурации и извлекает список абсолютно ВСЕХ 
+    объявленных интерфейсов устройства.
+    """
+    interfaces = set()
+    file_path = os.path.join(CONFIGS_DIR, f"{device_name}{CONFIG_EXTENSION}")
+    if not os.path.exists(file_path):
+        return interfaces
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line_strip = line.strip()
+                # Ищем строки, начинающиеся с interface, отсекая sub-интерфейсы по желанию или собирая всё
+                if line_strip.lower().startswith("interface ") and not line_strip.endswith(r" description"):
+                    iface_name = line_strip.replace("interface", "", 1).strip()
+                    if iface_name and not iface_name.lower().startswith("bgb"):
+                        interfaces.add(iface_name)
+    except Exception as e:
+        print(f"   ❌ Ошибка чтения интерфейсов из конфига {device_name}: {e}")
+    return interfaces
+
+
+def find_mgmt_interface_from_config(device_name, management_ip):
+    """Определяет по файлу конфигурации, на каком именно порту висит management_ip"""
+    file_path = os.path.join(CONFIGS_DIR, f"{device_name}{CONFIG_EXTENSION}")
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             config_text = f.read()
         pattern = r"interface\s+([^\n!]+)(?:\n(?:[ \t]+[^\n]+)*\n[ \t]+ip\s+address\s+" + re.escape(management_ip) + r"\b)"
         match = re.search(pattern, config_text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
+        if match: return match.group(1).strip()
+            
         lines = config_text.splitlines()
         for idx, line in enumerate(lines):
             if management_ip in line and "ip address" in line.lower():
@@ -74,190 +125,194 @@ def get_interface_from_config(device_name, management_ip):
 
 
 def get_or_create_interface(nb, nb_dev, interface_name):
-    """Ищет интерфейс по имени. Если его нет (например, виртуальный VLAN), создает его."""
+    """Ищет интерфейс в NetBox, если его нет — создает со строгим определением типа"""
     existing_iface = nb.dcim.interfaces.get(device_id=nb_dev.id, name=interface_name)
     if existing_iface:
         return existing_iface
         
-    print(f"   ⚠️  Интерфейс '{interface_name}' не найден в заводском шаблоне. Создаем вручную...")
     try:
-        name_lower = interface_name.lower()
-        if any(kw in name_lower for kw in ["vlan", "loopback", "bvi", "lo", "port-channel", "po"]):
-            iface_type = "virtual"
-        else:
-            iface_type = "1000base-t"
+        name_lower = interface_name.lower().strip()
         
-        return nb.dcim.interfaces.create(device=nb_dev.id, name=interface_name, type=iface_type)
+        # 1. СТРОГАЯ ПРОВЕРКА НА ЛОГИЧЕСКИЕ И SUB-ИНТЕРФЕЙСЫ (NetBox 4.x требует 'virtual')
+        # Если в имени есть точка (н-р Gi0/1.421) или это VLAN/Loopback/Port-Channel
+        if ("." in name_lower or 
+            any(kw in name_lower for kw in ["vlan", "loopback", "bvi", "lo", "port-channel", "po"])):
+            iface_type = "virtual"
+            
+        # 2. ПРОВЕРКА ФИЗИЧЕСКИХ ПОРТОВ (Ищем строго по началу строки)
+        elif name_lower.startswith(("tengigabitethernet", "ten", "te", "tg")):
+            iface_type = "10base-x-sfpp"  # 10 Гбит/с SFP+
+        elif name_lower.startswith(("gigabitethernet", "gig", "gi", "g")):
+            iface_type = "1000base-t"     # 1 Гбит/с Copper
+        elif name_lower.startswith(("fastethernet", "fast", "fa", "f")):
+            iface_type = "100base-tx"     # 100 Мбит/с FastEthernet
+        elif name_lower.startswith(("ethernet", "eth", "et", "e")):
+            iface_type = "1000base-t"     # Дефолтный физический Ethernet
+        else:
+            iface_type = "1000base-t"     # Универсальный подстраховочный дефолт
+
+        new_iface = nb.dcim.interfaces.create(
+            device=nb_dev.id,
+            name=interface_name,
+            type=iface_type
+        )
+        return new_iface
     except Exception as e:
-        print(f"   ❌ Не удалось досоздать интерфейс '{interface_name}': {e}")
+        print(f"   ❌ Не удалось создать интерфейс '{interface_name}' с типом '{iface_type}': {e}")
+        return None
+
+
+def get_or_create_device_type(nb, yaml_data, vendor_name):
+    model_name = yaml_data.get("model")
+    existing_type = nb.dcim.device_types.get(model=model_name)
+    if existing_type: return existing_type
+
+    print(f"   🏭 Шаблон '{model_name}' отсутствует в NetBox. Регистрируем...")
+    try:
+        slug_vendor = vendor_name.lower().replace(" ", "-").replace(".", "")
+        manufacturer = nb.dcim.manufacturers.get(slug=slug_vendor) or nb.dcim.manufacturers.create(name=vendor_name, slug=slug_vendor)
+
+        new_type = nb.dcim.device_types.create(
+            manufacturer=manufacturer.id, model=model_name,
+            slug=yaml_data.get("slug") or model_name.lower().replace(" ", "-").replace("/", "-"),
+            part_number=yaml_data.get("part_number", "")
+        )
+        if "interfaces" in yaml_data and yaml_data["interfaces"]:
+            for iface in yaml_data["interfaces"]:
+                try:
+                    nb.dcim.interface_templates.create(device_type=new_type.id, name=iface.get("name"), type=iface.get("type", "1000base-t"))
+                except Exception: pass
+        return new_type
+    except Exception as e:
+        print(f"   ❌ Ошибка при импорте типа устройства: {e}")
         return None
 
 
 def main():
-    api_token = get_netdisco_session()
-    if not api_token:
-        print("🛑 Синхронизация отменена из-за ошибки авторизации в Netdisco.")
-        return
-
-    req_headers = {"Authorization": api_token}
     nb = pynetbox.api(NETBOX_URL, token=NETBOX_TOKEN)
-    
-    # Запрашиваем роль Switch строго по slug
     switch_role = nb.dcim.device_roles.get(slug="switch")
     if not switch_role:
-        print("🛑 Критическая ошибка: Роль со slug 'switch' отсутствует в NetBox. Пересоздание невозможно.")
+        print("🛑 Критическая ошибка: Роль со slug 'switch' отсутствует в NetBox.")
         return
 
-    # Запрашиваем ВСЕ активные устройства из NetBox
     nb_devices = list(nb.dcim.devices.filter(status="active"))
-    print(f"\n🔄 Запуск безопасного пересоздания коммутаторов. Всего устройств на проверку: {len(nb_devices)}")
+    print(f"\n🔄 Синхронизация фабричных панелей портов и кастомных интерфейсов из файлов конфигураций: {len(nb_devices)}")
 
     for nb_dev in nb_devices:
-        if not nb_dev.name:
-            continue
-            
+        if not nb_dev.name: continue
         device_name = nb_dev.name.strip()
         current_role_slug = nb_dev.role.slug if nb_dev.role else ""
 
-        # СТРОЖАЙШИЙ ФИЛЬТР БЕЗОПАСНОСТИ: Обрабатываем ТОЛЬКО устройства с ролью Switch
-        if current_role_slug != "switch":
-            continue
-
-        # Фильтр по наличию локального конфига устройства
+        if current_role_slug != "switch": continue
         file_path = os.path.join(CONFIGS_DIR, f"{device_name}{CONFIG_EXTENSION}")
-        if not os.path.exists(file_path):
-            print(f"⏭️  {device_name}: роль 'switch', но локальный конфиг отсутствует. Пропускаем.")
-            continue
+        if not os.path.exists(file_path): continue
 
-        # Резолвим IP через DNS
-        management_ip = resolve_dns(device_name)
-        if not management_ip:
-            print(f"❌ {device_name}: Не резолвится в DNS. Пропускаем.")
-            continue
+        print(f"\n🔎 Анализ коммутатора: {device_name}")
 
-                # Проверяем текущую панель интерфейсов на самом устройстве
+        # 1. Извлекаем партномер и ищем шаблон
+        part_number = extract_part_number_from_config(device_name)
+        target_device_type = None
+        if part_number:
+            yaml_data, yaml_path = find_local_template_by_pn(part_number)
+            if yaml_data:
+                vendor_name = os.path.basename(os.path.dirname(yaml_path)).title()
+                target_device_type = get_or_create_device_type(nb, yaml_data, vendor_name)
+
+        # 2. Сверяем порты для триггера пересоздания
         current_interfaces = list(nb.dcim.interfaces.filter(device_id=nb_dev.id))
-        
-        current_type_name = nb_dev.device_type.model if nb_dev.device_type else ""
-        current_vendor = nb_dev.device_type.manufacturer.name if (nb_dev.device_type and nb_dev.device_type.manufacturer) else ""
-        current_role_slug = nb_dev.role.slug if nb_dev.role else ""
-
-        # Узнаем, сколько портов ДОЛЖНО БЫТЬ по заводскому шаблону
         templated_ports_count = 0
-        if nb_dev.device_type:
-            # Запрашиваем шаблоны интерфейсов, привязанные к этой модели
+        if target_device_type:
+            interface_templates = list(nb.dcim.interface_templates.filter(device_type_id=target_device_type.id))
+            templated_ports_count = len(interface_templates)
+        elif nb_dev.device_type:
             interface_templates = list(nb.dcim.interface_templates.filter(device_type_id=nb_dev.device_type.id))
             templated_ports_count = len(interface_templates)
 
-        # СТРОГОЕ УСЛОВИЕ ПЕРЕСОЗДАНИЯ:
-        # 1. Модель или Вендор содержат "Generic"
-        # 2. Количество портов на устройстве НЕ СОВПАДАЕТ с количеством портов в его шаблоне
         need_recreate = (
-            "generic" in current_type_name.lower() or
-            "generic" in current_vendor.lower() or
-            len(current_interfaces) != templated_ports_count
+            (target_device_type and (not nb_dev.device_type or nb_dev.device_type.id != target_device_type.id)) or 
+            len(current_interfaces) != templated_ports_count or 
+            templated_ports_count == 0
         )
 
-        if not need_recreate:
-            print(f"🔹 {device_name}: Шаблон '{current_type_name}' и все порты ({len(current_interfaces)} из {templated_ports_count}) корректны. Пропускаем.")
-            continue
-
-        print(f"\n🚨 Коммутатор {device_name} подлежит пересозданию!")
-        print(f"   [Детали]: Портов в NetBox: {len(current_interfaces)} | Ожидается по шаблону: {templated_ports_count} | Модель: '{current_type_name}'")
-
-
-        # Получаем правильную модель из Netdisco по точному IP
-        disco_model_name = None
-        try:
-            res = requests.get(f"{NETDISCO_URL}/api/v1/object/device/{management_ip}", headers=req_headers)
-            if res.status_code == 200:
-                csv_text = res.content.decode('utf-8')
-                reader = csv.DictReader(io.StringIO(csv_text.strip()))
-                search_data = list(reader)
-                if search_data:
-                    disco_device = search_data[0]
-                    disco_model_name = disco_device.get("Model", "").strip()
-        except Exception as e:
-            print(f"   ⚠️ Ошибка запроса к Netdisco для {device_name}: {e}")
-
-        # Подстраховка по имени модели
-        if not disco_model_name:
-            if current_type_name and "generic" not in current_type_name.lower():
-                disco_model_name = current_type_name
-            else:
-                print(f"   ❌ Не удалось определить заводскую модель через Netdisco. Пропускаем.")
+        active_dev = nb_dev
+        if need_recreate and target_device_type:
+            # Выполняем пересоздание
+            management_ip = resolve_dns(device_name)
+            if not management_ip:
+                print(f"   ❌ Не резолвится в DNS. Пересоздание пропущено.")
                 continue
 
-        # Проверяем, загружен ли такой Device Type с GitHub в NetBox
-        target_device_type = nb.dcim.device_types.get(model=disco_model_name)
-        if not target_device_type:
-            print(f"   ❌ В NetBox отсутствует фабричный шаблон для модели '{disco_model_name}'.")
-            print(f"      👉 Сначала запустите import_device_types.py для этой модели.")
-            continue
-
-        # Сохраняем метаданные коммутатора для бережного переноса
-        device_payload = {
-            "name": nb_dev.name,
-            "device_type": target_device_type.id,
-            "role": switch_role.id,
-            "site": nb_dev.site.id if nb_dev.site else None,
-            "status": "active",
-            "tenant": nb_dev.tenant.id if nb_dev.tenant else None,
-            "location": nb_dev.location.id if nb_dev.location else None,
-            "rack": nb_dev.rack.id if nb_dev.rack else None,
-            "position": nb_dev.position if nb_dev.position else None,
-            "face": nb_dev.face.value if nb_dev.face else None,
-        }
-
-        # БЕЗОПАСНОЕ ПЕРЕСОЗДАНИЕ КОММУТАТОРА
-        print(f"   🧹 Удаление старого некорректного коммутатора '{device_name}'...")
-        try:
-            # Снимаем блокировки NetBox, если на старом объекте висел Primary IP
-            if nb_dev.primary_ip4:
-                ip_id = nb_dev.primary_ip4.id
-                nb_dev.primary_ip4 = None
-                nb_dev.save()
-                nb.ipam.ip_addresses.delete([ip_id])
-
-            nb_dev.delete()
-            
-            # Создаем чистый объект, NetBox автоматически применит шаблон портов с GitHub
-            new_dev = nb.dcim.devices.create(**device_payload)
-            print(f"   🎉 Коммутатор пересоздан с шаблоном '{disco_model_name}'. Порты сгенерированы.")
-            
-        except Exception as e:
-            print(f"   ❌ Ошибка при пересоздании коммутатора: {e}")
-            continue
-
-        # НАПОЛНЕНИЕ СЕТЕВЫХ ДАННЫХ ИЗ КОНФИГА
-        target_iface_name = get_interface_from_config(device_name, management_ip)
-        if not target_iface_name:
-            print(f"   ⚠️  IP {management_ip} не найден в конфиге. Подстраховка: 'mgmt0'")
-            target_iface_name = "mgmt0"
-
-        # Ищем порт в развернутой NetBox-ом фабричной панели интерфейсов
-        target_interface = get_or_create_interface(nb, new_dev, target_iface_name)
-        
-        if target_interface:
+            device_payload = {
+                "name": nb_dev.name, "device_type": target_device_type.id, "role": switch_role.id,
+                "site": nb_dev.site.id if nb_dev.site else None, 
+                "status": "active",
+                "tenant": nb_dev.tenant.id if nb_dev.tenant else None, 
+                "location": nb_dev.location.id if nb_dev.location else None,
+                "rack": nb_dev.rack.id if nb_dev.rack else None, 
+                "position": nb_dev.position if nb_dev.position else None,
+                "face": nb_dev.face.value if nb_dev.face else None,
+            }
+            print("   🧹 Пересоздание: удаление старого объекта...")
             try:
-                ip_object = nb.ipam.ip_addresses.get(address=management_ip)
-                if ip_object:
-                    ip_object.assigned_object_type = "dcim.interface"
-                    ip_object.assigned_object_id = target_interface.id
-                    ip_object.save()
-                else:
-                    ip_object = nb.ipam.ip_addresses.create(
-                        address=f"{management_ip}/32",
-                        assigned_object_type="dcim.interface",
-                        assigned_object_id=target_interface.id
-                    )
-
-                if ip_object:
-                    new_dev.primary_ip4 = ip_object.id
-                    new_dev.save()
-                    print(f"   ✅ Сетевой адрес {management_ip} успешно привязан к интерфейсу '{target_iface_name}'.")
+                if nb_dev.primary_ip4:
+                    ip_id = nb_dev.primary_ip4.id
+                    nb_dev.primary_ip4 = None
+                    nb_dev.save()
+                    nb.ipam.ip_addresses.delete([ip_id])
+                nb_dev.delete()
+                active_dev = nb.dcim.devices.create(**device_payload)
+                print(f"   🎉 Объект пересоздан на основе фабричного шаблона '{target_device_type.model}'.")
             except Exception as e:
-                print(f"   ❌ Не удалось связать IP-адрес с обновленным интерфейсом: {e}")
-                print("\n🎉 Безопасное пересоздание коммутаторов завершено!")
+                print(f"   ❌ Ошибка при пересоздании: {e}")
+                continue
+        else:
+            print(f"   🔹 Базовая карточка '{active_dev.device_type.model}' корректна. Переходим к донарезке портов.")
+
+        # 3. ТОТАЛЬНАЯ ДОНАРЕЗКА ИНТЕРФЕЙСОВ ИЗ КОНФИГА
+        config_interfaces = get_all_interfaces_from_config(device_name)
+        print(f"   📊 Найдено интерфейсов в файле конфигурации: {len(config_interfaces)}")
+        
+        # Получаем текущее количество портов перед началом досоздания
+        pre_count = len(list(nb.dcim.interfaces.filter(device_id=active_dev.id)))
+        
+        for iface_name in config_interfaces:
+            get_or_create_interface(nb, active_dev, iface_name)
+            
+        # Считаем разницу, чтобы понять, сколько портов реально досоздалось
+        post_count = len(list(nb.dcim.interfaces.filter(device_id=active_dev.id)))
+        created_count = post_count - pre_count
+
+        if created_count > 0:
+            print(f"   ✅ Из файла конфигурации досоздано уникальных интерфейсов: {created_count}")
+
+        # 4. Привязка Management IP
+        management_ip = resolve_dns(device_name)
+        if management_ip:
+            target_iface_name = find_mgmt_interface_from_config(device_name, management_ip) or "mgmt0"
+            target_interface = get_or_create_interface(nb, active_dev, target_iface_name)
+            
+            if target_interface:
+                try:
+                    ip_object = nb.ipam.ip_addresses.get(address=management_ip)
+                    if ip_object:
+                        ip_object.assigned_object_type = "dcim.interface"
+                        ip_object.assigned_object_id = target_interface.id
+                        ip_object.save()
+                    else:
+                        ip_object = nb.ipam.ip_addresses.create(
+                            address=f"{management_ip}/32", 
+                            assigned_object_type="dcim.interface", 
+                            assigned_object_id=target_interface.id
+                        )
+                        
+                    if ip_object and (not active_dev.primary_ip4 or active_dev.primary_ip4.address.split('/')[0] != management_ip):
+                        active_dev.primary_ip4 = ip_object.id
+                        active_dev.save()
+                        print(f"   ✅ IP {management_ip} жестко закреплен за интерфейсом '{target_iface_name}' и сделан Primary.")
+                except Exception as e:
+                    print(f"   ❌ Не удалось связать IP-адрес: {e}")
+
+    print("\n🎉 Все коммутаторы успешно насыщены фабричными и кастомными интерфейсами!")
+
 if __name__ == "__main__":
     main()
