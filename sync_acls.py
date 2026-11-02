@@ -21,8 +21,8 @@ CONFIGS_DIR = os.path.expanduser(RAW_CONFIGS_DIR)
 CONFIG_EXTENSION = ""  # Конфиги без расширения
 
 # Настройки подключения к NetBox
-DEVICE_NAME = "mc-i-1"
-CONFIG_FILE = f"{CONFIGS_DIR}mc-i-1.cfg"
+DEVICE_NAME = "lab-2801-1"
+CONFIG_FILE = f"{CONFIGS_DIR}lab-2801-1.cfg"
 
 
 
