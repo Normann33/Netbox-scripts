@@ -1,0 +1,43 @@
+! Шаблоны для настраиваемых строк в Netbox (Custom links)
+! Используются в плагине netbox-acl, в правилах аксесс-листа вместо стандартных колонок Источник/Назначение
+! Если в правиле указана object-group (Address set из плагина netbox-security), то отображается она, если нет
+!- ip адрес/префикс из IPAM, если ничего не прописано, то any
+
+! Visual source
+! Текст ссылки:
+{% if object.cf.src_obj_gr %}
+  {{ object.cf.src_obj_gr.name }}
+{% elif object.source %}
+  {{ object.source }}
+{% else %}
+  any
+{% endif %}
+
+! URL:
+{% if object.cf.src_obj_gr %}
+  {{ object.cf.src_obj_gr.get_absolute_url() }}
+{% elif object.source %}
+  {{ object.source.get_absolute_url() }}
+{% else %}
+  #
+{% endif %}
+
+! Visual destination
+! Текст ссылки:
+{% if object.cf.dst_obj_gr %}
+  {{ object.cf.dst_obj_gr.name }}
+{% elif object.destination %}
+  {{ object.destination }}
+{% else %}
+  any
+{% endif %}
+
+! URL:
+
+{% if object.cf.dst_obj_gr %}
+  {{ object.cf.dst_obj_gr.get_absolute_url() }}
+{% elif object.destination %}
+  {{ object.destination.get_absolute_url() }}
+{% else %}
+  #
+{% endif %}
